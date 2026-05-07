@@ -47,6 +47,7 @@ class BracketEngine:
 
         # double elimination data
         self.losers_rounds: List[RoundData] = []
+        self.initial_names: List[str] = []
 
     @staticmethod
     def _next_power_of_two(n: int) -> int:
@@ -61,6 +62,7 @@ class BracketEngine:
         self.finished = False
         self.rounds = []
         self.losers_rounds = []
+        self.initial_names = [n.strip() for n in names if n.strip()]
 
         participants = [Participant(n.strip()) for n in names if n.strip()]
         random.shuffle(participants)
@@ -91,11 +93,10 @@ class BracketEngine:
             self.rounds.append(RoundData(f"Round {r}", [Match(None, None) for _ in range(match_count)]))
 
         if self.mode == "double":
-            # Simplified losers bracket structure for extensibility.
-            losers_round_count = max(1, rounds_count - 1)
-            for r in range(1, losers_round_count + 1):
-                cnt = max(1, bracket_size // (2 ** (r + 1)))
-                self.losers_rounds.append(RoundData(f"Losers R{r}", [Match(None, None) for _ in range(cnt)]))
+            for i in range(2 * (rounds_count - 1)):
+                cnt = max(1, bracket_size // (2 ** ((i // 2) + 2)))
+                self.losers_rounds.append(RoundData(f"Losers R{i+1}", [Match(None, None) for _ in range(cnt)]))
+            self.losers_rounds.append(RoundData("Losers Final", [Match(None, None)]))
 
     def current_round(self) -> RoundData:
         return self.rounds[self.current_round_idx]
@@ -106,79 +107,97 @@ class BracketEngine:
         if winner is None:
             return
         match.winner = winner
+        self._recompute_all_rounds()
 
+    def _recompute_all_rounds(self):
+        for r_idx in range(1, len(self.rounds)):
+            prev_winners = [m.winner for m in self.rounds[r_idx - 1].matches]
+            for i, m in enumerate(self.rounds[r_idx].matches):
+                m.p1 = prev_winners[2 * i] if 2 * i < len(prev_winners) else None
+                m.p2 = prev_winners[2 * i + 1] if 2 * i + 1 < len(prev_winners) else None
+                if m.winner not in (m.p1, m.p2):
+                    m.winner = None
+                if m.p1 and not m.p2:
+                    m.winner = m.p1
+                elif m.p2 and not m.p1:
+                    m.winner = m.p2
+
+        self.current_round_idx = self._first_unfinished_winners_round()
+        self.finished = bool(self.rounds and self.rounds[-1].matches and self.rounds[-1].matches[0].winner)
         if self.mode == "double":
-            loser = match.p2 if winner_slot == 1 else match.p1
-            if loser:
-                self._drop_to_losers(round_idx, loser)
+            self._recompute_losers_rounds()
 
-    def _drop_to_losers(self, winners_round_idx: int, loser: Participant):
-        if not self.losers_rounds:
-            return
-        target = min(winners_round_idx, len(self.losers_rounds) - 1)
-        for m in self.losers_rounds[target].matches:
-            if m.p1 is None:
-                m.p1 = loser
-                return
-            if m.p2 is None:
-                m.p2 = loser
-                return
+    def _first_unfinished_winners_round(self) -> int:
+        for i, rnd in enumerate(self.rounds):
+            if any((m.p1 or m.p2) and m.winner is None for m in rnd.matches):
+                return i
+        return max(0, len(self.rounds) - 1)
 
-    def advance_round(self):
-        if self.finished:
-            return
-        if self.current_round_idx >= len(self.rounds) - 1:
-            self.finished = True
-            return
+    def _recompute_losers_rounds(self):
+        for rnd in self.losers_rounds:
+            for m in rnd.matches:
+                m.p1 = None
+                m.p2 = None
+                m.winner = None
 
-        current = self.rounds[self.current_round_idx]
-        next_round = self.rounds[self.current_round_idx + 1]
+        wb_losers: List[List[Participant]] = []
+        for rnd in self.rounds:
+            losers = []
+            for m in rnd.matches:
+                if m.winner and m.p1 and m.p2:
+                    losers.append(m.p2 if m.winner == m.p1 else m.p1)
+            wb_losers.append(losers)
 
-        winners = [m.winner for m in current.matches if m.winner is not None]
-        for m in next_round.matches:
-            m.p1 = None
-            m.p2 = None
-            m.winner = None
-
-        for i, winner in enumerate(winners):
-            target = next_round.matches[i // 2]
-            if i % 2 == 0:
-                target.p1 = winner
+        lb_prev_winners: List[Participant] = []
+        for i, lb_round in enumerate(self.losers_rounds[:-1]):
+            entrants = []
+            if i == 0:
+                entrants.extend(wb_losers[0] if wb_losers else [])
+            elif i % 2 == 0:
+                wb_idx = min((i // 2) + 1, len(wb_losers) - 1)
+                entrants.extend(lb_prev_winners)
+                entrants.extend(wb_losers[wb_idx] if wb_idx >= 0 else [])
             else:
-                target.p2 = winner
+                entrants.extend(lb_prev_winners)
 
-        for m in next_round.matches:
-            if m.p1 and not m.p2:
-                m.winner = m.p1
-            elif m.p2 and not m.p1:
-                m.winner = m.p2
+            lb_prev_winners = []
+            for m_idx, m in enumerate(lb_round.matches):
+                m.p1 = entrants[2 * m_idx] if 2 * m_idx < len(entrants) else None
+                m.p2 = entrants[2 * m_idx + 1] if 2 * m_idx + 1 < len(entrants) else None
+                if m.winner not in (m.p1, m.p2):
+                    m.winner = None
+                if m.p1 and not m.p2:
+                    m.winner = m.p1
+                elif m.p2 and not m.p1:
+                    m.winner = m.p2
+                if m.winner:
+                    lb_prev_winners.append(m.winner)
 
-        self.current_round_idx += 1
-        if self.current_round_idx == len(self.rounds) - 1:
-            final_round = self.rounds[self.current_round_idx]
-            if len(final_round.matches) == 1 and final_round.matches[0].winner:
-                self.finished = True
+        if self.losers_rounds:
+            grand = self.losers_rounds[-1].matches[0]
+            wb_final_loser = None
+            if self.rounds and self.rounds[-1].matches:
+                final = self.rounds[-1].matches[0]
+                if final.winner and final.p1 and final.p2:
+                    wb_final_loser = final.p2 if final.winner == final.p1 else final.p1
+            grand.p1 = lb_prev_winners[0] if lb_prev_winners else None
+            grand.p2 = wb_final_loser
 
     def randomize_current_round(self):
-        r = self.current_round()
-        pool = []
-        for m in r.matches:
-            if m.p1:
-                pool.append(m.p1)
-            if m.p2:
-                pool.append(m.p2)
+        participants = [Participant(n) for n in self.initial_names]
+        random.shuffle(participants)
+        size = len(self.rounds[0].matches) * 2
+        participants += [None] * (size - len(participants))
+        random.shuffle(participants)
+        for i, m in enumerate(self.rounds[0].matches):
+            m.p1 = participants[2 * i]
+            m.p2 = participants[2 * i + 1]
             m.winner = None
-        random.shuffle(pool)
-        while len(pool) < len(r.matches) * 2:
-            pool.append(None)
-
-        for i, m in enumerate(r.matches):
-            m.p1 = pool[2 * i]
-            m.p2 = pool[2 * i + 1]
             if m.p1 and not m.p2:
                 m.winner = m.p1
             elif m.p2 and not m.p1:
                 m.winner = m.p2
+        self._recompute_all_rounds()
 
     def export_json(self) -> dict:
         return {
@@ -250,12 +269,10 @@ class BracketApp(tk.Tk):
 
         ttk.Button(control, text="Create Bracket", command=self.create_bracket).grid(row=6, column=0, sticky="ew", pady=(12, 4))
         ttk.Button(control, text="Randomize Seeding", command=self.randomize_current).grid(row=7, column=0, sticky="ew", pady=4)
-        ttk.Button(control, text="Advance Round", command=self.advance_round).grid(row=8, column=0, sticky="ew", pady=4)
-        ttk.Button(control, text="Save Finished Bracket", command=self.save_finished).grid(row=9, column=0, sticky="ew", pady=4)
-        ttk.Button(control, text="Save Options Help", command=self.show_save_suggestions).grid(row=10, column=0, sticky="ew", pady=4)
+        ttk.Button(control, text="Save Finished Bracket", command=self.save_finished).grid(row=8, column=0, sticky="ew", pady=4)
 
         self.status_var = tk.StringVar(value="Ready")
-        ttk.Label(control, textvariable=self.status_var, wraplength=220).grid(row=11, column=0, sticky="ew", pady=(10, 0))
+        ttk.Label(control, textvariable=self.status_var, wraplength=220).grid(row=9, column=0, sticky="ew", pady=(10, 0))
 
         board = ttk.Frame(self, padding=6)
         board.grid(row=0, column=1, sticky="nsew")
@@ -324,36 +341,42 @@ class BracketApp(tk.Tk):
                 card = ttk.Frame(col, relief="solid", borderwidth=1, padding=8)
                 card.grid(row=m_idx, column=0, sticky="ew", pady=6)
 
-                ttk.Label(card, text=m.display_label(), width=32).grid(row=0, column=0, columnspan=2, sticky="w")
-                winner = m.winner.name if m.winner else "(none)"
-                ttk.Label(card, text=f"Winner: {winner}").grid(row=1, column=0, columnspan=2, sticky="w")
+                ttk.Label(card, text=m.display_label(), width=32, foreground="#005bbb", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, columnspan=2, sticky="w")
 
                 is_active = (r_idx == current)
                 p1_enabled = is_active and m.p1 is not None
                 p2_enabled = is_active and m.p2 is not None
 
-                ttk.Button(card, text="Pick P1", command=lambda rr=r_idx, mm=m_idx: self.pick(rr, mm, 1), state=("normal" if p1_enabled else "disabled")).grid(row=2, column=0, sticky="ew", pady=(4, 0))
-                ttk.Button(card, text="Pick P2", command=lambda rr=r_idx, mm=m_idx: self.pick(rr, mm, 2), state=("normal" if p2_enabled else "disabled")).grid(row=2, column=1, sticky="ew", pady=(4, 0))
+                p1_text = m.p1.name if m.p1 else "TBD"
+                p2_text = m.p2.name if m.p2 else "TBD"
+                b1 = tk.Button(card, text=p1_text, command=lambda rr=r_idx, mm=m_idx: self.pick(rr, mm, 1), state=("normal" if p1_enabled else "disabled"))
+                b2 = tk.Button(card, text=p2_text, command=lambda rr=r_idx, mm=m_idx: self.pick(rr, mm, 2), state=("normal" if p2_enabled else "disabled"))
+                if m.winner == m.p1 and m.p1:
+                    b1.configure(bg="#c8f7c5")
+                if m.winner == m.p2 and m.p2:
+                    b2.configure(bg="#c8f7c5")
+                b1.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+                b2.grid(row=1, column=1, sticky="ew", pady=(4, 0))
 
                 if self.engine.best_of_enabled:
-                    ttk.Label(card, text="Score note:").grid(row=3, column=0, sticky="w", pady=(6, 0))
+                    ttk.Label(card, text="Score note:").grid(row=2, column=0, sticky="w", pady=(6, 0))
                     s1 = tk.StringVar(value=m.score1)
                     s2 = tk.StringVar(value=m.score2)
                     e1 = ttk.Entry(card, width=5, textvariable=s1)
                     e2 = ttk.Entry(card, width=5, textvariable=s2)
-                    e1.grid(row=3, column=0, sticky="e", padx=(0, 28))
-                    e2.grid(row=3, column=1, sticky="w")
+                    e1.grid(row=2, column=0, sticky="e", padx=(0, 28))
+                    e2.grid(row=2, column=1, sticky="w")
                     self.score_entries.append((s1, s2, r_idx, m_idx))
 
         if self.engine.mode == "double" and self.engine.losers_rounds:
             losers_col_start = len(self.engine.rounds)
             for li, rnd in enumerate(self.engine.losers_rounds):
                 col = ttk.LabelFrame(self.inner, text=rnd.name)
-                col.grid(row=1, column=losers_col_start + li, sticky="n", padx=12, pady=8)
+                col.grid(row=2, column=li, sticky="n", padx=12, pady=8)
                 for m_idx, m in enumerate(rnd.matches):
                     card = ttk.Frame(col, relief="solid", borderwidth=1, padding=8)
                     card.grid(row=m_idx, column=0, sticky="ew", pady=6)
-                    ttk.Label(card, text=m.display_label(), width=28).grid(row=0, column=0, sticky="w")
+                    ttk.Label(card, text=m.display_label(), width=28, foreground="#7a1f7a").grid(row=0, column=0, sticky="w")
 
     def pick(self, round_idx: int, match_idx: int, side: int):
         self._store_scores()
@@ -365,27 +388,17 @@ class BracketApp(tk.Tk):
             self.engine.rounds[r].matches[m].score1 = s1.get()
             self.engine.rounds[r].matches[m].score2 = s2.get()
 
-    def advance_round(self):
-        self._store_scores()
-        self.engine.advance_round()
-        self.render()
-        if self.engine.finished:
-            messagebox.showinfo("Completed", "Bracket is finished. You can now save it.")
-            self.status_var.set("Bracket finished.")
-        else:
-            self.status_var.set(f"Advanced to round {self.engine.current_round_idx + 1}.")
-
     def randomize_current(self):
         if not self.engine.rounds:
             messagebox.showwarning("No bracket", "Create a bracket first.")
             return
-        round_name = self.engine.current_round().name
-        confirmed = messagebox.askyesno("Confirm randomize", f"Randomize matchups for {round_name}? This clears current winner picks in that round.")
+        round_name = self.engine.rounds[0].name
+        confirmed = messagebox.askyesno("Confirm randomize", f"Randomize first-round seeding? This resets the bracket.")
         if not confirmed:
             return
         self._store_scores()
         self.engine.randomize_current_round()
-        self.status_var.set(f"Randomized seeding for {round_name}.")
+        self.status_var.set(f"Randomized seeding for {round_name} and reset downstream rounds.")
         self.render()
 
     def save_finished(self):
@@ -407,18 +420,6 @@ class BracketApp(tk.Tk):
         data = self.engine.export_json()
         Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
         messagebox.showinfo("Saved", f"Saved bracket to:\n{path}")
-
-    def show_save_suggestions(self):
-        messagebox.showinfo(
-            "Save format suggestions",
-            "Recommended primary format: JSON (preserves structure + winners + score notes).\n\n"
-            "Other useful exports to add later:\n"
-            "• PDF: best for printing/sharing static finished bracket.\n"
-            "• PNG/SVG image: quick visual sharing, no editability.\n"
-            "• HTML export: viewable in browser with structure retained.\n\n"
-            "For now, JSON is implemented because it is easiest to reload/extend safely.",
-        )
-
 
 if __name__ == "__main__":
     app = BracketApp()
